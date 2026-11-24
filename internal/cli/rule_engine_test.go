@@ -597,3 +597,78 @@ func encodeSymbol(t *testing.T, symbol string) string {
 	}
 	return encoded
 }
+
+type mockAlertSink struct {
+	dispatched []sink.AlertNotification
+}
+
+func (m *mockAlertSink) Dispatch(ctx context.Context, alert sink.AlertNotification) error {
+	m.dispatched = append(m.dispatched, alert)
+	return nil
+}
+
+func (m *mockAlertSink) DispatchAsync(alert sink.AlertNotification) bool {
+	m.dispatched = append(m.dispatched, alert)
+	return true
+}
+
+func (m *mockAlertSink) Close() error {
+	return nil
+}
+
+func TestRuleEngineAlertDispatch(t *testing.T) {
+	engine := NewRuleEngine()
+	mockSink := &mockAlertSink{}
+	engine.AddAlertSink(mockSink)
+
+	err := engine.AddAlertRule(AlertRule{
+		Name:        "HighSeqAlert",
+		Expression:  "ledger.sequence > 100",
+		Severity:    "critical",
+		Description: "Ledger sequence is high",
+	})
+	if err != nil {
+		t.Fatalf("AddAlertRule() error = %v", err)
+	}
+
+	// Record with sequence 50 (should not trigger)
+	recLow := stream.Record{Sequence: 50}
+	triggeredLow := engine.EvaluateAndAlert(context.Background(), recLow)
+	if len(triggeredLow) != 0 {
+		t.Errorf("expected 0 triggered alerts, got %d", len(triggeredLow))
+	}
+	if len(mockSink.dispatched) != 0 {
+		t.Errorf("expected 0 dispatched alerts, got %d", len(mockSink.dispatched))
+	}
+
+	// Record with sequence 150 (should trigger)
+	recHigh := stream.Record{
+		Sequence: 150,
+		Event: &stream.Event{
+			TxHash:     "hash123",
+			ContractID: "contract456",
+		},
+	}
+	triggeredHigh := engine.EvaluateAndAlert(context.Background(), recHigh)
+	if len(triggeredHigh) != 1 {
+		t.Fatalf("expected 1 triggered alert, got %d", len(triggeredHigh))
+	}
+	if len(mockSink.dispatched) != 1 {
+		t.Fatalf("expected 1 dispatched alert, got %d", len(mockSink.dispatched))
+	}
+
+	alert := mockSink.dispatched[0]
+	if alert.RuleName != "HighSeqAlert" {
+		t.Errorf("rule name = %q, want HighSeqAlert", alert.RuleName)
+	}
+	if alert.Severity != "critical" {
+		t.Errorf("severity = %q, want critical", alert.Severity)
+	}
+	if alert.TxHash != "hash123" {
+		t.Errorf("txHash = %q, want hash123", alert.TxHash)
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Errorf("engine.Close() error = %v", err)
+	}
+}
