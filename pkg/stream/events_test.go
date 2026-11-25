@@ -119,3 +119,63 @@ func TestTailerRecordBufferReusePreservesDeliveredRecords(t *testing.T) {
 		t.Fatalf("delivered event = %+v, want retained contract event", delivered[0].Event)
 	}
 }
+
+type batchRecordingClient struct {
+	rpc.Client
+	batchCalls int
+	batchSizes []int
+}
+
+func (c *batchRecordingClient) GetEvents(context.Context, protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
+	return protocol.GetEventsResponse{}, nil
+}
+
+func (c *batchRecordingClient) GetEventsBatch(_ context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
+	c.batchCalls++
+	c.batchSizes = append(c.batchSizes, len(reqs))
+	out := make([]protocol.GetEventsResponse, len(reqs))
+	for i := range reqs {
+		out[i] = protocol.GetEventsResponse{
+			Events: []protocol.EventInfo{{
+				ID:         (protocol.Cursor{Ledger: 10, Event: uint32(i + 1)}).String(),
+				Ledger:     10,
+				EventType:  protocol.EventTypeContract,
+				ContractID: reqs[i].Filters[0].ContractIDs[0],
+			}},
+			Cursor:       (protocol.Cursor{Ledger: 10, Event: uint32(i + 1)}).String(),
+			LatestLedger: 10,
+			OldestLedger: 1,
+		}
+	}
+	return out, nil
+}
+
+type staticWatchlist []string
+
+func (w staticWatchlist) ContractIDs() []string { return append([]string(nil), w...) }
+
+func TestEventSourceUsesGetEventsBatchForMultipleContractGroups(t *testing.T) {
+	client := &batchRecordingClient{}
+	watchlist := staticWatchlist{
+		testContractID(1), testContractID(2), testContractID(3),
+		testContractID(4), testContractID(5), testContractID(6),
+	}
+	source, err := NewEventSource(client, EventQuery{Watchlist: watchlist, StartLedger: 10})
+	if err != nil {
+		t.Fatalf("NewEventSource() error = %v", err)
+	}
+
+	batch, err := source.Fetch(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	if client.batchCalls != 1 {
+		t.Fatalf("GetEventsBatch calls = %d, want 1", client.batchCalls)
+	}
+	if !reflect.DeepEqual(client.batchSizes, []int{2}) {
+		t.Fatalf("batch sizes = %v, want [2]", client.batchSizes)
+	}
+	if len(batch.Records) != 2 {
+		t.Fatalf("got %d records, want 2", len(batch.Records))
+	}
+}

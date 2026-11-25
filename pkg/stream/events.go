@@ -185,12 +185,12 @@ func (s *EventSource) Fetch(ctx context.Context, cursor string) (Batch, error) {
 	merged := Batch{Records: getRecordBuffer(initialCapacity)}
 	seen := getEventIDSet()
 	defer putEventIDSet(seen)
-	for _, group := range groups {
-		batch, err := s.fetchGroup(ctx, cursor, group)
-		if err != nil {
-			putRecordBuffer(merged.Records)
-			return Batch{}, err
-		}
+	batches, err := s.fetchGroups(ctx, cursor, groups)
+	if err != nil {
+		putRecordBuffer(merged.Records)
+		return Batch{}, err
+	}
+	for _, batch := range batches {
 		if batch.Latest > merged.Latest {
 			merged.Latest = batch.Latest
 		}
@@ -236,7 +236,37 @@ func splitContractIDs(ids []string) [][]string {
 	return groups
 }
 
-func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs []string) (Batch, error) {
+func (s *EventSource) fetchGroups(ctx context.Context, cursor string, groups [][]string) ([]Batch, error) {
+	if len(groups) == 1 {
+		batch, err := s.fetchGroup(ctx, cursor, groups[0])
+		if err != nil {
+			return nil, err
+		}
+		return []Batch{batch}, nil
+	}
+
+	reqs := make([]protocol.GetEventsRequest, len(groups))
+	for i, group := range groups {
+		req, err := s.buildGroupRequest(cursor, group)
+		if err != nil {
+			return nil, err
+		}
+		reqs[i] = req
+	}
+
+	resps, err := s.client.GetEventsBatch(ctx, reqs)
+	if err != nil {
+		return nil, err
+	}
+
+	batches := make([]Batch, len(resps))
+	for i, resp := range resps {
+		batches[i] = s.batchFromResponse(resp)
+	}
+	return batches, nil
+}
+
+func (s *EventSource) buildGroupRequest(cursor string, contractIDs []string) (protocol.GetEventsRequest, error) {
 	req := protocol.GetEventsRequest{
 		Filters: s.filters(contractIDs),
 		Pagination: &protocol.PaginationOptions{
@@ -246,19 +276,18 @@ func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs
 
 	if cursor == "" {
 		req.StartLedger = s.query.StartLedger
-	} else {
-		parsed, err := protocol.ParseCursor(cursor)
-		if err != nil {
-			return Batch{}, rpc.Permanent(fmt.Errorf("invalid cursor %q: %w", cursor, err))
-		}
-		req.Pagination.Cursor = &parsed
+		return req, nil
 	}
 
-	resp, err := s.client.GetEvents(ctx, req)
+	parsed, err := protocol.ParseCursor(cursor)
 	if err != nil {
-		return Batch{}, err
+		return protocol.GetEventsRequest{}, rpc.Permanent(fmt.Errorf("invalid cursor %q: %w", cursor, err))
 	}
+	req.Pagination.Cursor = &parsed
+	return req, nil
+}
 
+func (s *EventSource) batchFromResponse(resp protocol.GetEventsResponse) Batch {
 	batch := Batch{
 		Records:    make([]Record, 0, len(resp.Events)),
 		NextCursor: resp.Cursor,
@@ -269,7 +298,21 @@ func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs
 	for _, e := range resp.Events {
 		batch.Records = append(batch.Records, eventRecord(e))
 	}
-	return batch, nil
+	return batch
+}
+
+func (s *EventSource) fetchGroup(ctx context.Context, cursor string, contractIDs []string) (Batch, error) {
+	req, err := s.buildGroupRequest(cursor, contractIDs)
+	if err != nil {
+		return Batch{}, err
+	}
+
+	resp, err := s.client.GetEvents(ctx, req)
+	if err != nil {
+		return Batch{}, err
+	}
+
+	return s.batchFromResponse(resp), nil
 }
 
 // eventRecord converts an RPC event into a neutral Record.

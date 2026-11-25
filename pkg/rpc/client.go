@@ -8,14 +8,18 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -135,7 +139,40 @@ func ResolveSRV(domain string) ([]string, error) {
 
 // SDKClient adapts the Stellar SDK's RPC client to the Client interface.
 type SDKClient struct {
-	inner *rpcclient.Client
+	url        string
+	httpClient *http.Client
+	inner      *rpcclient.Client
+}
+
+// RpcRequest represents a single JSON-RPC 2.0 request item in a batch call.
+type RpcRequest struct {
+	JSONRPC string `json:"jsonrpc,omitempty"`
+	ID      any    `json:"id"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
+}
+
+// RpcError represents a JSON-RPC 2.0 error object returned for a batch item.
+type RpcError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// Error implements error.
+func (e *RpcError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("json-rpc error %d: %s", e.Code, e.Message)
+}
+
+// RpcResponse represents a single JSON-RPC 2.0 response item correlated by ID.
+type RpcResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *RpcError       `json:"error,omitempty"`
 }
 
 // New returns a Client backed by the Stellar SDK, talking to url.
@@ -162,7 +199,9 @@ func NewWithTransport(url string, timeout time.Duration, transport http.RoundTri
 		httpClient.Transport = transport
 	}
 	return &SDKClient{
-		inner: rpcclient.NewClient(url, httpClient),
+		url:        url,
+		httpClient: httpClient,
+		inner:      rpcclient.NewClient(url, httpClient),
 	}
 }
 
@@ -188,22 +227,212 @@ func (c *SDKClient) GetEvents(ctx context.Context, req protocol.GetEventsRequest
 	return resp, nil
 }
 
-// GetEventsBatch implements Client.
+// BatchCall sends a slice of JSON-RPC 2.0 requests in a single HTTP POST
+// array payload and correlates the returned responses by request ID.
+//
+// Partial failures are preserved: if individual batch items return JSON-RPC
+// errors or are omitted by the server, all received responses are returned in
+// the input request order alongside a joined error describing the failures.
+func (c *SDKClient) BatchCall(ctx context.Context, requests []RpcRequest) (_ []RpcResponse, retErr error) {
+	if len(requests) == 0 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	outbound := make([]RpcRequest, len(requests))
+	idKeys := make([]string, len(requests))
+	idToIndex := make(map[string]int, len(requests))
+	for i, req := range requests {
+		if req.Method == "" {
+			return nil, Permanent(fmt.Errorf("rpc batch: request %d has empty method", i))
+		}
+		if req.JSONRPC == "" {
+			req.JSONRPC = "2.0"
+		}
+		if req.ID == nil {
+			req.ID = i + 1
+		}
+		key, err := canonicalRPCID(req.ID)
+		if err != nil {
+			return nil, Permanent(fmt.Errorf("rpc batch: request %d invalid id: %w", i, err))
+		}
+		if prev, dup := idToIndex[key]; dup {
+			return nil, Permanent(fmt.Errorf("rpc batch: requests %d and %d share duplicate id %s", prev, i, key))
+		}
+		idToIndex[key] = i
+		idKeys[i] = key
+		outbound[i] = req
+	}
+
+	payload, err := json.Marshal(outbound)
+	if err != nil {
+		return nil, fmt.Errorf("rpc batch: marshalling requests: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("rpc batch: building request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("rpc batch: %w", err)
+	}
+	defer func() {
+		if closeErr := httpResp.Body.Close(); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("rpc batch: closing response body: %w", closeErr)
+		}
+	}()
+
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("rpc batch: reading response: %w", err)
+	}
+	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+		snippet := strings.TrimSpace(string(body))
+		if snippet != "" {
+			return nil, fmt.Errorf("rpc batch: http %d %s: %s", httpResp.StatusCode, httpResp.Status, snippet)
+		}
+		return nil, fmt.Errorf("rpc batch: http %d %s", httpResp.StatusCode, httpResp.Status)
+	}
+
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("rpc batch: empty response body")
+	}
+	if trimmed[0] == '{' {
+		var single RpcResponse
+		if err := json.Unmarshal(trimmed, &single); err != nil {
+			return nil, fmt.Errorf("rpc batch: decoding error object: %w", err)
+		}
+		if single.Error != nil {
+			return nil, fmt.Errorf("rpc batch: %w", single.Error)
+		}
+		return nil, fmt.Errorf("rpc batch: expected JSON array response, got single object")
+	}
+
+	var rawResponses []RpcResponse
+	if err := json.Unmarshal(trimmed, &rawResponses); err != nil {
+		return nil, fmt.Errorf("rpc batch: decoding response array: %w", err)
+	}
+
+	ordered := make([]RpcResponse, len(requests))
+	seen := make([]bool, len(requests))
+	var itemErrs []error
+	for i, resp := range rawResponses {
+		key, err := canonicalRawRPCID(resp.ID)
+		if err != nil {
+			itemErrs = append(itemErrs, fmt.Errorf("response %d has invalid id %s: %w", i, string(resp.ID), err))
+			continue
+		}
+		idx, ok := idToIndex[key]
+		if !ok {
+			itemErrs = append(itemErrs, fmt.Errorf("unexpected response id %s", key))
+			continue
+		}
+		if seen[idx] {
+			itemErrs = append(itemErrs, fmt.Errorf("duplicate response for id %s", key))
+			continue
+		}
+		seen[idx] = true
+		ordered[idx] = resp
+		if resp.Error != nil {
+			itemErrs = append(itemErrs, fmt.Errorf("item %d (id %s): %w", idx, key, resp.Error))
+		}
+	}
+
+	for idx, ok := range seen {
+		if !ok {
+			itemErrs = append(itemErrs, fmt.Errorf("missing response for item %d (id %s)", idx, idKeys[idx]))
+		}
+	}
+
+	if len(itemErrs) > 0 {
+		return ordered, errors.Join(itemErrs...)
+	}
+	return ordered, nil
+}
+
+func canonicalRPCID(id any) (string, error) {
+	raw, err := json.Marshal(id)
+	if err != nil {
+		return "", err
+	}
+	return canonicalRawRPCID(raw)
+}
+
+func canonicalRawRPCID(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", errors.New("null or empty id")
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return "", err
+		}
+		encoded, err := json.Marshal(s)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	}
+	if n, err := strconv.ParseInt(string(trimmed), 10, 64); err == nil {
+		return strconv.FormatInt(n, 10), nil
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err != nil {
+		return "", err
+	}
+	return compact.String(), nil
+}
+
+// GetEventsBatch implements Client, packing all queries into a single JSON-RPC
+// 2.0 batch request and returning partial responses up to any failed entry.
 func (c *SDKClient) GetEventsBatch(ctx context.Context, reqs []protocol.GetEventsRequest) ([]protocol.GetEventsResponse, error) {
 	if len(reqs) == 0 {
 		return nil, nil
 	}
-	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
-	for _, req := range reqs {
-		resp, err := c.inner.GetEvents(ctx, req)
-		if err != nil {
-			// Hand back the responses gathered so far with the error. Dropping
-			// them would force the caller to re-issue requests that already
-			// succeeded; swallowing the error would report a truncated batch as
-			// complete.
-			return responses, fmt.Errorf("rpc getEventsBatch: %w", err)
+
+	rpcReqs := make([]RpcRequest, len(reqs))
+	for i, req := range reqs {
+		rpcReqs[i] = RpcRequest{
+			JSONRPC: "2.0",
+			ID:      i + 1,
+			Method:  protocol.GetEventsMethodName,
+			Params:  req,
 		}
-		responses = append(responses, resp)
+	}
+
+	rawResps, batchErr := c.BatchCall(ctx, rpcReqs)
+	if len(rawResps) == 0 && batchErr != nil {
+		return nil, fmt.Errorf("rpc getEventsBatch: %w", batchErr)
+	}
+
+	responses := make([]protocol.GetEventsResponse, 0, len(reqs))
+	for i, rawResp := range rawResps {
+		if rawResp.Error != nil {
+			// Hand back the responses gathered before the failure alongside the error.
+			return responses, fmt.Errorf("rpc getEventsBatch: item %d: %w", i, rawResp.Error)
+		}
+		if len(rawResp.Result) == 0 {
+			if batchErr != nil {
+				return responses, fmt.Errorf("rpc getEventsBatch: %w", batchErr)
+			}
+			return responses, fmt.Errorf("rpc getEventsBatch: item %d: missing result", i)
+		}
+		var decoded protocol.GetEventsResponse
+		if err := json.Unmarshal(rawResp.Result, &decoded); err != nil {
+			return responses, fmt.Errorf("rpc getEventsBatch: decode item %d: %w", i, err)
+		}
+		responses = append(responses, decoded)
+	}
+	if batchErr != nil {
+		return responses, fmt.Errorf("rpc getEventsBatch: %w", batchErr)
 	}
 	return responses, nil
 }

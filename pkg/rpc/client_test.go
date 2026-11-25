@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -577,5 +578,179 @@ func TestNewWithOptionsComposesTransportAndHeaders(t *testing.T) {
 	}
 	if seen != "opt-secret" {
 		t.Errorf("transport saw X-Api-Key = %q, want %q", seen, "opt-secret")
+	}
+}
+
+func TestBatchCallPacksSingleRequestAndCorrelatesOutOfOrderResponses(t *testing.T) {
+	t.Parallel()
+
+	var httpCalls atomic.Int32
+	var seenPayload []rpc.RpcRequest
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
+		if err := json.Unmarshal(body, &seenPayload); err != nil {
+			http.Error(w, "expected json-rpc array", http.StatusBadRequest)
+			return
+		}
+
+		// Respond in reverse ID order to exercise correlation by ID.
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"jsonrpc": "2.0", "id": "b", "result": map[string]any{"sequence": 200}},
+			{"jsonrpc": "2.0", "id": "a", "result": map[string]any{"sequence": 100}},
+		})
+	}))
+	defer srv.Close()
+
+	client := rpc.New(srv.URL, 5*time.Second)
+	defer client.Close()
+
+	resps, err := client.BatchCall(t.Context(), []rpc.RpcRequest{
+		{ID: "a", Method: "getLatestLedger"},
+		{ID: "b", Method: "getLatestLedger"},
+	})
+	if err != nil {
+		t.Fatalf("BatchCall() error = %v", err)
+	}
+	if httpCalls.Load() != 1 {
+		t.Fatalf("HTTP calls = %d, want 1 batched POST", httpCalls.Load())
+	}
+	if len(seenPayload) != 2 || seenPayload[0].JSONRPC != "2.0" || seenPayload[1].JSONRPC != "2.0" {
+		t.Fatalf("outbound batch payload = %+v, want jsonrpc 2.0 array of 2", seenPayload)
+	}
+	if len(resps) != 2 {
+		t.Fatalf("len(resps) = %d, want 2", len(resps))
+	}
+	if !strings.Contains(string(resps[0].Result), "100") || !strings.Contains(string(resps[1].Result), "200") {
+		t.Errorf("out-of-order responses were not correlated by ID: %+v", resps)
+	}
+}
+
+func TestBatchCallAndGetEventsBatchHandlePartialFailures(t *testing.T) {
+	t.Parallel()
+
+	var httpCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
+		var reqs []struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.Unmarshal(body, &reqs); err != nil {
+			http.Error(w, "bad json array", http.StatusBadRequest)
+			return
+		}
+		if len(reqs) != 3 {
+			http.Error(w, fmt.Sprintf("expected 3 batch items, got %d", len(reqs)), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]any{
+			{
+				"jsonrpc": "2.0",
+				"id":      reqs[0].ID,
+				"result": map[string]any{
+					"events":                []any{},
+					"cursor":                "c1",
+					"latestLedger":          101,
+					"oldestLedger":          90,
+					"latestLedgerCloseTime": "1700000000",
+					"oldestLedgerCloseTime": "1700000000",
+				},
+			},
+			{
+				"jsonrpc": "2.0",
+				"id":      reqs[1].ID,
+				"error": map[string]any{
+					"code":    -32602,
+					"message": "invalid ledger range",
+				},
+			},
+			{
+				"jsonrpc": "2.0",
+				"id":      reqs[2].ID,
+				"result": map[string]any{
+					"events":                []any{},
+					"cursor":                "c3",
+					"latestLedger":          103,
+					"oldestLedger":          90,
+					"latestLedgerCloseTime": "1700000000",
+					"oldestLedgerCloseTime": "1700000000",
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	client := rpc.New(srv.URL, 5*time.Second)
+	defer client.Close()
+
+	resps, err := client.GetEventsBatch(t.Context(), []protocol.GetEventsRequest{
+		{StartLedger: 100},
+		{StartLedger: 101},
+		{StartLedger: 102},
+	})
+	if err == nil {
+		t.Fatal("GetEventsBatch() error = nil, want partial batch error")
+	}
+	if !strings.Contains(err.Error(), "invalid ledger range") {
+		t.Errorf("error = %v, want item error message", err)
+	}
+	if httpCalls.Load() != 1 {
+		t.Errorf("HTTP calls = %d, want 1", httpCalls.Load())
+	}
+	if len(resps) != 1 || resps[0].Cursor != "c1" {
+		t.Errorf("partial responses = %+v, want first successful response before failure", resps)
+	}
+}
+
+func TestBatchCallRejectsDuplicateIDsAndMissingResponses(t *testing.T) {
+	t.Parallel()
+
+	client := rpc.New("https://example.invalid", 5*time.Second)
+	defer client.Close()
+
+	if resps, err := client.BatchCall(t.Context(), nil); err != nil || resps != nil {
+		t.Fatalf("empty BatchCall = (%v, %v), want (nil, nil)", resps, err)
+	}
+
+	if _, err := client.BatchCall(t.Context(), []rpc.RpcRequest{
+		{ID: 1, Method: "getHealth"},
+		{ID: 1, Method: "getLatestLedger"},
+	}); !rpc.IsPermanent(err) {
+		t.Errorf("duplicate IDs error = %v, want permanent error", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"status": "healthy"}},
+		})
+	}))
+	defer srv.Close()
+
+	c2 := rpc.New(srv.URL, 5*time.Second)
+	defer c2.Close()
+
+	resps, err := c2.BatchCall(t.Context(), []rpc.RpcRequest{
+		{Method: "getHealth"},
+		{Method: "getLatestLedger"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing response") {
+		t.Fatalf("missing response error = %v, want missing response failure", err)
+	}
+	if len(resps) != 2 || len(resps[0].Result) == 0 {
+		t.Errorf("resps = %+v, want correlated first result preserved", resps)
 	}
 }
