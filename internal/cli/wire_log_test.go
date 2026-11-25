@@ -368,3 +368,29 @@ func TestEventsCommandCustomHeadersAndWireLogRedaction(t *testing.T) {
 		}
 	}
 }
+
+func TestRPCRateLimitFlagValidationAndHelp(t *testing.T) {
+	stdout, _, err := run(t, "events", "--help")
+	if err != nil {
+		t.Fatalf("Execute(--help) error = %v", err)
+	}
+	if !strings.Contains(stdout, "--rpc-rate-limit") {
+		t.Errorf("help does not mention --rpc-rate-limit\n%s", stdout)
+	}
+
+	if _, _, err := run(t, "events", "--from", "9000", "--rpc-rate-limit", "-1", "--rpc-url", "http://127.0.0.1:1"); err == nil {
+		t.Fatal("negative --rpc-rate-limit succeeded, want validation error")
+	}
+
+	var capture wireCapture
+	srv := newWireRPCServer(t, &capture)
+	defer srv.Close()
+
+	_, stderr, err := run(t, "events", "--from", "9000", "--json",
+		"--insecure-skip-network-check",
+		"--rpc-url", srv.URL,
+		"--rpc-rate-limit", "10")
+	if err != nil {
+		t.Fatalf("Execute() with --rpc-rate-limit error = %v\nstderr:\n%s", err, stderr)
+	}
+}

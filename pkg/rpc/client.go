@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
@@ -194,9 +197,12 @@ func NewWithTransport(url string, timeout time.Duration, transport http.RoundTri
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	httpClient := &http.Client{Timeout: timeout}
-	if transport != nil {
-		httpClient.Transport = transport
+	if _, ok := transport.(*rateLimitTransport); !ok {
+		transport = NewRateLimitTransport(transport, RateLimitConfig{})
+	}
+	httpClient := &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
 	}
 	return &SDKClient{
 		url:        url,
@@ -215,6 +221,9 @@ func NewWithHeaders(url string, timeout time.Duration, headers http.Header) *SDK
 func NewWithOptions(url string, timeout time.Duration, opts ...NewClientOption) *SDKClient {
 	applied := applyNewClientOptions(opts...)
 	transport := NewHeaderTransport(applied.transport, applied.headers)
+	if applied.rateLimit != nil {
+		transport = NewRateLimitTransport(transport, *applied.rateLimit)
+	}
 	return NewWithTransport(url, timeout, transport)
 }
 
@@ -540,12 +549,17 @@ type NewClientOption struct {
 
 	// Transport, when set, overrides the base HTTP round tripper.
 	Transport http.RoundTripper
+
+	// RateLimit, when set, configures client-side token-bucket throttling and
+	// HTTP 429 Retry-After backoff on the HTTP transport.
+	RateLimit *RateLimitConfig
 }
 
 // newClientOptions collects options for SDK client creation.
 type newClientOptions struct {
 	transport http.RoundTripper
 	headers   http.Header
+	rateLimit *RateLimitConfig
 }
 
 // applyNewClientOptions resolves opts into the concrete transport settings
@@ -572,6 +586,10 @@ func applyNewClientOptions(opts ...NewClientOption) newClientOptions {
 				applied.headers = make(http.Header, len(opt.Headers))
 			}
 			mergeHeaders(applied.headers, opt.Headers)
+		}
+		if opt.RateLimit != nil {
+			cfg := *opt.RateLimit
+			applied.rateLimit = &cfg
 		}
 	}
 	return applied
@@ -869,4 +887,320 @@ func IsRetryable(err error) bool {
 		}
 	}
 	return false
+}
+
+const (
+	defaultRateLimitMaxRetries     = 5
+	defaultRateLimitInitialBackoff = 250 * time.Millisecond
+	defaultRateLimitMaxBackoff     = 30 * time.Second
+)
+
+// RateLimitConfig configures client-side token-bucket throttling and adaptive
+// HTTP 429 Retry-After backoff for outgoing RPC requests.
+type RateLimitConfig struct {
+	// RequestsPerSecond caps outgoing RPC requests per second. Zero or
+	// negative disables proactive throttling while keeping HTTP 429 backoff.
+	RequestsPerSecond float64
+	// Burst sets the token bucket capacity. When <= 0 and RequestsPerSecond > 0,
+	// it defaults to max(1, ceil(RequestsPerSecond)).
+	Burst int
+	// MaxRetries bounds consecutive HTTP 429 retries inside RoundTrip.
+	// Zero uses defaultRateLimitMaxRetries (5); negative disables retrying.
+	MaxRetries int
+	// InitialBackoff and MaxBackoff bound exponential backoff with jitter when
+	// an HTTP 429 response does not include a valid Retry-After header.
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+	// Now, Sleep, and Rand are optional hooks for deterministic testing.
+	Now   func() time.Time
+	Sleep func(context.Context, time.Duration) error
+	Rand  func() float64
+}
+
+// TokenBucket is a thread-safe token bucket limiter that also coordinates
+// shared cooldown windows triggered by HTTP 429 Retry-After responses.
+type TokenBucket struct {
+	mu           sync.Mutex
+	rps          float64
+	burst        float64
+	tokens       float64
+	last         time.Time
+	blockedUntil time.Time
+	now          func() time.Time
+	sleep        func(context.Context, time.Duration) error
+}
+
+// NewTokenBucket constructs a TokenBucket permitting rps requests per second
+// with the given burst capacity. Non-positive rps disables token throttling
+// while preserving PauseFor cooldown support.
+func NewTokenBucket(rps float64, burst int, now func() time.Time, sleep func(context.Context, time.Duration) error) *TokenBucket {
+	if now == nil {
+		now = time.Now
+	}
+	if sleep == nil {
+		sleep = sleepWithContext
+	}
+	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+		rps = 0
+	}
+	if rps > 0 && burst <= 0 {
+		burst = max(1, int(math.Ceil(rps)))
+	}
+	return &TokenBucket{
+		rps:    rps,
+		burst:  float64(burst),
+		tokens: float64(burst),
+		last:   now(),
+		now:    now,
+		sleep:  sleep,
+	}
+}
+
+// Wait blocks until any active 429 cooldown has elapsed and, if rate limiting
+// is configured, a token is available, or until ctx is canceled.
+func (b *TokenBucket) Wait(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		b.mu.Lock()
+		now := b.now()
+		if b.blockedUntil.After(now) {
+			wait := b.blockedUntil.Sub(now)
+			b.mu.Unlock()
+			if err := b.sleep(ctx, wait); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if b.rps <= 0 {
+			b.mu.Unlock()
+			return nil
+		}
+
+		if elapsed := now.Sub(b.last); elapsed > 0 {
+			b.tokens = math.Min(b.burst, b.tokens+elapsed.Seconds()*b.rps)
+			b.last = now
+		}
+
+		b.tokens--
+		if b.tokens >= 0 {
+			b.mu.Unlock()
+			return nil
+		}
+
+		deficit := -b.tokens
+		wait := time.Duration(math.Ceil((deficit / b.rps) * float64(time.Second)))
+		b.mu.Unlock()
+
+		if wait <= 0 {
+			return nil
+		}
+		return b.sleep(ctx, wait)
+	}
+}
+
+// PauseFor drains available tokens and pauses all Wait callers for d.
+func (b *TokenBucket) PauseFor(d time.Duration) {
+	if b == nil || d <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	if b.tokens > 0 {
+		b.tokens = 0
+	}
+	b.last = now
+	until := now.Add(d)
+	if until.After(b.blockedUntil) {
+		b.blockedUntil = until
+	}
+}
+
+// ParseRetryAfter parses an HTTP Retry-After header value (either non-negative
+// integer seconds or an HTTP-date) relative to now.
+func ParseRetryAfter(header string, now time.Time) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(header)
+	if trimmed == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if when, err := http.ParseTime(trimmed); err == nil {
+		if !when.After(now) {
+			return 0, true
+		}
+		return when.Sub(now), true
+	}
+	return 0, false
+}
+
+// NewRateLimitTransport wraps base with client-side token-bucket rate limiting
+// and adaptive HTTP 429 Retry-After backoff.
+func NewRateLimitTransport(base http.RoundTripper, cfg RateLimitConfig) http.RoundTripper {
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	sleep := cfg.Sleep
+	if sleep == nil {
+		sleep = sleepWithContext
+	}
+	randFn := cfg.Rand
+	if randFn == nil {
+		randFn = rand.Float64
+	}
+	maxRetries := cfg.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = defaultRateLimitMaxRetries
+	} else if maxRetries < 0 {
+		maxRetries = 0
+	}
+	initial := cfg.InitialBackoff
+	if initial <= 0 {
+		initial = defaultRateLimitInitialBackoff
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = defaultRateLimitMaxBackoff
+	}
+	if maxBackoff < initial {
+		maxBackoff = initial
+	}
+
+	return &rateLimitTransport{
+		base:           base,
+		bucket:         NewTokenBucket(cfg.RequestsPerSecond, cfg.Burst, now, sleep),
+		maxRetries:     maxRetries,
+		initialBackoff: initial,
+		maxBackoff:     maxBackoff,
+		now:            now,
+		rand:           randFn,
+	}
+}
+
+type rateLimitTransport struct {
+	base           http.RoundTripper
+	bucket         *TokenBucket
+	maxRetries     int
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+	now            func() time.Time
+	rand           func() float64
+}
+
+func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, errors.New("rpc: nil request")
+	}
+
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+
+	var bodyBytes []byte
+	hasBufferedBody := false
+	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil && t.maxRetries > 0 {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		closeErr := req.Body.Close()
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("rpc rate limit: buffering request body: %w", err), closeErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("rpc rate limit: closing request body: %w", closeErr)
+		}
+		hasBufferedBody = true
+	}
+
+	for attempt := 0; ; attempt++ {
+		if err := t.bucket.Wait(req.Context()); err != nil {
+			return nil, err
+		}
+
+		attemptReq := req.Clone(req.Context())
+		if hasBufferedBody {
+			attemptReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			attemptReq.ContentLength = int64(len(bodyBytes))
+		} else if attempt > 0 && req.GetBody != nil {
+			freshBody, err := req.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("rpc rate limit: resetting request body: %w", err)
+			}
+			attemptReq.Body = freshBody
+		}
+
+		resp, err := base.RoundTrip(attemptReq)
+		if err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+			return resp, err
+		}
+		if attempt >= t.maxRetries {
+			return resp, nil
+		}
+
+		delay, ok := ParseRetryAfter(resp.Header.Get("Retry-After"), t.now())
+		if !ok {
+			delay = t.jitteredBackoff(attempt)
+		}
+
+		if closeErr := drainAndCloseBody(resp.Body); closeErr != nil {
+			return nil, fmt.Errorf("rpc rate limit: draining 429 response: %w", closeErr)
+		}
+
+		t.bucket.PauseFor(delay)
+	}
+}
+
+func (t *rateLimitTransport) jitteredBackoff(attempt int) time.Duration {
+	delay := t.initialBackoff
+	for i := 0; i < attempt && delay < t.maxBackoff; i++ {
+		if delay > t.maxBackoff/2 {
+			delay = t.maxBackoff
+			break
+		}
+		delay *= 2
+	}
+	if delay > t.maxBackoff {
+		delay = t.maxBackoff
+	}
+	half := float64(delay) / 2
+	return time.Duration(half + half*t.rand())
+}
+
+func drainAndCloseBody(body io.ReadCloser) error {
+	if body == nil {
+		return nil
+	}
+	_, copyErr := io.Copy(io.Discard, body)
+	closeErr := body.Close()
+	return errors.Join(copyErr, closeErr)
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

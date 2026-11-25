@@ -754,3 +754,203 @@ func TestBatchCallRejectsDuplicateIDsAndMissingResponses(t *testing.T) {
 		t.Errorf("resps = %+v, want correlated first result preserved", resps)
 	}
 }
+
+func TestRateLimitTransportRespectsTokenBucketRate(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	now := time.Unix(1_700_000_000, 0)
+	var sleeps []time.Duration
+
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":{}}`)),
+		}, nil
+	})
+
+	rt := rpc.NewRateLimitTransport(base, rpc.RateLimitConfig{
+		RequestsPerSecond: 2,
+		Burst:             1,
+		Now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		},
+		Sleep: func(_ context.Context, d time.Duration) error {
+			mu.Lock()
+			sleeps = append(sleeps, d)
+			now = now.Add(d)
+			mu.Unlock()
+			return nil
+		},
+	})
+
+	for range 3 {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://example.invalid", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("NewRequestWithContext() error = %v", err)
+		}
+		resp, err := rt.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip() error = %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if len(sleeps) != 2 {
+		t.Fatalf("sleep count = %d, want 2 (1st request uses burst, 2nd & 3rd wait): %v", len(sleeps), sleeps)
+	}
+	for i, d := range sleeps {
+		if d != 500*time.Millisecond {
+			t.Errorf("sleep[%d] = %v, want 500ms for 2 req/s", i, d)
+		}
+	}
+}
+
+func TestRateLimitTransportHandles429RetryAfterAndBackoff(t *testing.T) {
+	t.Parallel()
+
+	t.Run("integer Retry-After pauses and replays request body", func(t *testing.T) {
+		t.Parallel()
+
+		var mu sync.Mutex
+		now := time.Unix(1_700_000_000, 0)
+		var sleeps []time.Duration
+		var attempts int
+		var bodies []string
+
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			raw, err := io.ReadAll(req.Body)
+			if err != nil {
+				return nil, err
+			}
+			mu.Lock()
+			attempts++
+			attempt := attempts
+			bodies = append(bodies, string(raw))
+			mu.Unlock()
+
+			if attempt == 1 {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Header:     http.Header{"Retry-After": {"3"}},
+					Body:       io.NopCloser(strings.NewReader("rate limited")),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+			}, nil
+		})
+
+		rt := rpc.NewRateLimitTransport(base, rpc.RateLimitConfig{
+			Now: func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				return now
+			},
+			Sleep: func(_ context.Context, d time.Duration) error {
+				mu.Lock()
+				sleeps = append(sleeps, d)
+				now = now.Add(d)
+				mu.Unlock()
+				return nil
+			},
+		})
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://example.invalid", strings.NewReader(`{"method":"getEvents"}`))
+		if err != nil {
+			t.Fatalf("NewRequestWithContext() error = %v", err)
+		}
+		resp, err := rt.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip() error = %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 after 429 retry", resp.StatusCode)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts = %d, want 2", attempts)
+		}
+		if !slices.Equal(bodies, []string{`{"method":"getEvents"}`, `{"method":"getEvents"}`}) {
+			t.Errorf("request bodies across retries = %v", bodies)
+		}
+		if !slices.Equal(sleeps, []time.Duration{3 * time.Second}) {
+			t.Errorf("sleeps = %v, want [3s]", sleeps)
+		}
+	})
+
+	t.Run("missing Retry-After uses exponential backoff with jitter", func(t *testing.T) {
+		t.Parallel()
+
+		var mu sync.Mutex
+		now := time.Unix(1_700_000_000, 0)
+		var sleeps []time.Duration
+		var attempts int
+
+		base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			mu.Lock()
+			attempts++
+			attempt := attempts
+			mu.Unlock()
+			if attempt <= 2 {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader("slow down")),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{}`)),
+			}, nil
+		})
+
+		rt := rpc.NewRateLimitTransport(base, rpc.RateLimitConfig{
+			InitialBackoff: 100 * time.Millisecond,
+			MaxBackoff:     1 * time.Second,
+			Rand:           func() float64 { return 1.0 },
+			Now: func() time.Time {
+				mu.Lock()
+				defer mu.Unlock()
+				return now
+			},
+			Sleep: func(_ context.Context, d time.Duration) error {
+				mu.Lock()
+				sleeps = append(sleeps, d)
+				now = now.Add(d)
+				mu.Unlock()
+				return nil
+			},
+		})
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.invalid", nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext() error = %v", err)
+		}
+		resp, err := rt.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip() error = %v", err)
+		}
+		resp.Body.Close()
+
+		if !slices.Equal(sleeps, []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}) {
+			t.Errorf("backoff sleeps = %v, want [100ms 200ms]", sleeps)
+		}
+	})
+
+	t.Run("HTTP-date Retry-After parsing", func(t *testing.T) {
+		t.Parallel()
+
+		baseTime := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+		delay, ok := rpc.ParseRetryAfter("Wed, 25 Nov 2026 12:00:05 GMT", baseTime)
+		if !ok || delay != 5*time.Second {
+			t.Errorf("ParseRetryAfter(HTTP-date) = (%v, %v), want (5s, true)", delay, ok)
+		}
+		if _, ok := rpc.ParseRetryAfter("not-a-header", baseTime); ok {
+			t.Error("ParseRetryAfter(invalid) = ok=true, want false")
+		}
+	})
+}

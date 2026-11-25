@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -79,6 +80,11 @@ func client(g *globalFlags, stderr io.Writer) (rpc.Client, func(), error) {
 		// Wrap the wire logger so it records (and redacts) the custom headers
 		// that actually go out on the wire.
 		transport = rpc.NewHeaderTransport(transport, headers)
+	}
+	if g.rpcRateLimit > 0 {
+		transport = rpc.NewRateLimitTransport(transport, rpc.RateLimitConfig{
+			RequestsPerSecond: g.rpcRateLimit,
+		})
 	}
 
 	var c rpc.Client
@@ -203,6 +209,8 @@ type globalFlags struct {
 	headers []string
 	// timeout bounds a single RPC call.
 	timeout time.Duration
+	// rpcRateLimit caps outgoing RPC requests per second when positive.
+	rpcRateLimit float64
 	// wireLog is the debug wire-log destination; empty disables it and "-"
 	// writes to stderr.
 	wireLog string
@@ -315,6 +323,9 @@ redacted before anything is written.`,
 			if err := g.validateWireLog(cmd); err != nil {
 				return err
 			}
+			if g.rpcRateLimit < 0 || math.IsNaN(g.rpcRateLimit) || math.IsInf(g.rpcRateLimit, 0) {
+				return fmt.Errorf("--rpc-rate-limit must be a non-negative finite number")
+			}
 			return g.startProfiler(stderr)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -333,6 +344,8 @@ redacted before anything is written.`,
 		`custom HTTP header ("Key: Value") attached to RPC requests; repeat for multiple headers (env $`+rpc.HeadersEnvVar+`)`)
 	root.PersistentFlags().DurationVar(&g.timeout, "rpc-timeout", 30*time.Second,
 		"timeout for a single RPC call")
+	root.PersistentFlags().Float64Var(&g.rpcRateLimit, "rpc-rate-limit", 0,
+		"maximum outgoing RPC requests per second (0 disables client-side throttling)")
 	root.PersistentFlags().StringVar(&g.wireLog, "wire-log", "",
 		`write a debug NDJSON log of RPC requests and responses to this file, with Authorization and other credential headers redacted ("-" writes to stderr)`)
 	root.PersistentFlags().Int64Var(&g.wireLogMaxBody, "wire-log-max-body", 0,
