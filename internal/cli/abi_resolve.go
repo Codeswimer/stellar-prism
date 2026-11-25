@@ -33,6 +33,7 @@ var errNoContractSpec = fmt.Errorf("contract WASM has no %q custom section", con
 type contractSpec struct {
 	ContractID string
 	WasmHash   xdr.Hash
+	Entries    []xdr.ScSpecEntry
 	Functions  []xdr.ScSpecFunctionV0
 	Structs    []xdr.ScSpecUdtStructV0
 	Unions     []xdr.ScSpecUdtUnionV0
@@ -143,7 +144,7 @@ func resolveContractSpec(ctx context.Context, client prismrpc.Client, contractID
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
 	}
 
-	spec := &contractSpec{ContractID: contractID, WasmHash: hash}
+	spec := &contractSpec{ContractID: contractID, WasmHash: hash, Entries: specEntries}
 	if err := spec.add(specEntries); err != nil {
 		return nil, fmt.Errorf("contract %s: %w", contractID, err)
 	}

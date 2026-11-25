@@ -4,180 +4,469 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
+	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
-// newGenerateTypesCmd implements the `prism generate-types` command.
+// newGenerateTypesCmd builds `prism generate-types`.
 //
-// prism generate-types --contract CDLZF... --out ./events_gen.go
-//
-// Fetches the contract's WASM bytecode from RPC and extracts event specifications
-// embedded in the contract's custom WASM section.
-// Generates strongly-typed Go structs and unpacking functions for each event
-// type defined in the contract ABI.
-//
-// The generated file contains Go structs with doc comments describing each
-// event's topics and values, plus helper functions to decode ScVal values
-// (integers, addresses, symbols) from the untyped xdr.ScVal structures
-// that Soroban contract events encode.
+// It resolves a contract's on-chain WASM contractspecv0 custom section via
+// Soroban RPC and emits standalone TypeScript declarations for all structs,
+// unions, enums, error enums, and event types defined in the contract spec.
 func newGenerateTypesCmd(g *globalFlags, stdout, stderr io.Writer) *cobra.Command {
-	var contractID string
-	var out string
+	var (
+		contractID string
+		out        string
+	)
 
 	cmd := &cobra.Command{
-		Use:   "generate-types --contract CDLZF... --out ./events_gen.go",
-		Short: "Generate typed Go structs from contract WASM event specs",
-		Long: `Fetch a contract's WASM bytecode from RPC and generate idiomatic Go
-structs and unpacking functions for every event type defined in its ABI.
+		Use:   "generate-types [<contract-id>]",
+		Short: "Generate TypeScript type definitions from contract WASM specs",
+		Long: `Fetch a contract's WASM bytecode from RPC, parse the Soroban spec embedded
+in its contractspecv0 custom section, and generate TypeScript interfaces,
+enums, and union types for all contract types and events.
 
-The contract's custom WASM section contains ScSpecEntry entries that describe
-each event's topics and values. This command parses those specifications and
-emit Go code that eliminates the need for manual type-assertion boilerplate
-when consuming prism streams.
+Pass the contract ID either positionally or via --contract. When --out is
+omitted, the generated TypeScript is written to stdout.`,
+		Example: `  # Print TypeScript types to stdout
+  prism generate-types CBGSB...
 
-Example:
+  # Write TypeScript definitions to a file
+  prism generate-types CBGSB... --out ./src/contract-types.ts
 
-  # Generate types for a contract
-  prism generate-types --contract CDLZF3MA... --out ./events_gen.go
-
-  # Generate types and write to a specific path
-  prism generate-types --contract CDLZF3MA... --out ./pkg/events/events_gen.go`,
-		Args: cobra.ExactArgs(0),
+  # Flag form
+  prism generate-types --contract CBGSB... --out ./src/contract-types.ts`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if contractID == "" {
-				return fmt.Errorf("--contract is required")
-			}
-			if out == "" {
-				return fmt.Errorf("--out is required")
-			}
-
-			// For now, use a placeholder - in production this would fetch from RPC
-			_ = g
-			_ = stdout
-			_ = stderr
-			_ = contractID
-			_ = out
-
-			// Parse the WASM spec to extract ScSpecEntry events
-			events, err := parseWASMSpec(nil)
+			resolvedID, err := resolveGenerateTypesContractID(args, contractID)
 			if err != nil {
-				return fmt.Errorf("parsing WASM spec: %w", err)
+				return err
 			}
 
-			// Generate Go code
-			gen := generateGoStructs(events)
+			client, closeClient, err := openClient(g, stderr)
+			if err != nil {
+				return err
+			}
+			defer closeClient()
 
-			// Write to output file
-			if err := os.WriteFile(out, []byte(gen), 0o644); err != nil {
-				return fmt.Errorf("writing output file: %w", err)
+			spec, err := resolveContractSpec(cmd.Context(), client, resolvedID)
+			if err != nil {
+				return err
 			}
 
-			fmt.Fprintf(stdout, "Generated %d event types to %s\n", len(events), out)
+			ts, err := generateTypeScript(spec.Entries)
+			if err != nil {
+				return fmt.Errorf("generating TypeScript types for %s: %w", resolvedID, err)
+			}
+
+			if out == "" {
+				if _, err := io.WriteString(stdout, ts); err != nil {
+					return fmt.Errorf("writing TypeScript output: %w", err)
+				}
+				return nil
+			}
+
+			dir := filepath.Dir(out)
+			if dir != "" && dir != "." {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return fmt.Errorf("creating output directory %q: %w", dir, err)
+				}
+			}
+			if err := os.WriteFile(out, []byte(ts), 0o644); err != nil {
+				return fmt.Errorf("writing output file %q: %w", out, err)
+			}
+
+			if _, err := fmt.Fprintf(stdout, "Generated TypeScript types for %s to %s\n", resolvedID, out); err != nil {
+				return fmt.Errorf("writing status output: %w", err)
+			}
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&contractID, "contract", "", "contract ID to generate types for (required)")
-	cmd.Flags().StringVar(&out, "out", "", "output file path (required)")
+	cmd.Flags().StringVar(&contractID, "contract", "", "contract ID to generate types for")
+	cmd.Flags().StringVar(&out, "out", "", "output TypeScript file path (default: stdout)")
 
 	return cmd
 }
 
-// parseWASMSpec parses the WASM bytecode to extract ScSpecEntry event specifications.
-// This is a placeholder for the actual WASM section parser.
-func parseWASMSpec(wasmBytes []byte) ([]eventSpec, error) {
-	// In a real implementation, this would:
-	// 1. Locate the custom WASM section in the contract binary
-	// 2. Parse the ScSpecEntry entries embedded within
-	// 3. Extract topic/value type information for each event
-	// 4. Return a list of event specifications
-
-	// For now, return a placeholder result
-	return []eventSpec{
-		{
-			Name:   "Transfer",
-			Topics: []topicSpec{{Name: "from", Type: "address"}},
-			Values: []topicSpec{{Name: "amount", Type: "u32"}},
-		},
-	}, nil
+func resolveGenerateTypesContractID(args []string, flagID string) (string, error) {
+	flagID = strings.TrimSpace(flagID)
+	var posID string
+	if len(args) > 0 {
+		posID = strings.TrimSpace(args[0])
+	}
+	if posID != "" && flagID != "" && posID != flagID {
+		return "", fmt.Errorf("conflicting contract IDs: positional %q and --contract %q", posID, flagID)
+	}
+	if posID != "" {
+		return posID, nil
+	}
+	if flagID != "" {
+		return flagID, nil
+	}
+	return "", fmt.Errorf("contract ID is required: pass <contract-id> or --contract")
 }
 
-// eventSpec represents a single event extracted from contract WASM.
-type eventSpec struct {
-	Name   string
-	Topics []topicSpec
-	Values []topicSpec
-}
-
-// topicSpec represents a single topic or value field in an event.
-type topicSpec struct {
-	Name string
-	Type string
-}
-
-// generateGoStructs generates Go structs and unpacking functions from event specs.
-func generateGoStructs(events []eventSpec) string {
-	var result string
-
-	result += "// Code generated by prism generate-types. DO NOT EDIT.\n\n"
-	result += "package events\n\n"
-
-	for _, event := range events {
-		result += fmt.Sprintf("// %s is the generated struct for the %s event.\n", event.Name, event.Name)
-		result += fmt.Sprintf("type %s struct {\n", event.Name)
-
-		// Add topic fields
-		for _, topic := range event.Topics {
-			result += fmt.Sprintf("\t// %s is the %s topic value (decoded from ScVal)\n", topic.Name, topic.Type)
-			result += fmt.Sprintf("\t%s %s\n", capitalize(topic.Name), goTypeFromXDRType(topic.Type))
-		}
-
-		// Add value fields
-		for _, value := range event.Values {
-			result += fmt.Sprintf("\t// %s is the %s value field (decoded from ScVal)\n", value.Name, value.Type)
-			result += fmt.Sprintf("\t%s %s\n", capitalize(value.Name), goTypeFromXDRType(value.Type))
-		}
-
-		result += "}\n\n"
-
-		// Add unpacking function
-		result += fmt.Sprintf("func Unmarshal%s(eventXDR string) (*%s, error) {\n", event.Name, event.Name)
-		result += "\t// Decode the XDR event and return a typed struct\n"
-		result += "\t// This is a placeholder - real implementation decodes ScVal values\n"
-		result += "\treturn &" + event.Name + "{}, nil\n"
-		result += "}\n\n"
+// generateTypeScript converts Soroban contract spec entries into standalone
+// TypeScript declarations that compile cleanly under strict tsc settings.
+func generateTypeScript(entries []xdr.ScSpecEntry) (string, error) {
+	var spec contractSpec
+	if err := spec.add(entries); err != nil {
+		return "", err
 	}
 
-	return result
-}
+	var b strings.Builder
+	b.WriteString("// Code generated by prism generate-types. DO NOT EDIT.\n")
 
-// capitalize capitalizes the first letter of a string.
-func capitalize(s string) string {
-	if len(s) == 0 {
-		return s
+	used := make(map[string]struct{})
+	wroteDecl := false
+	startDecl := func() {
+		b.WriteByte('\n')
+		wroteDecl = true
 	}
-	return string(s[0]) + s[1:]
+
+	for _, item := range spec.Structs {
+		startDecl()
+		writeTSDoc(&b, item.Doc, "")
+		name := claimTSIdent(item.Name, used, "Type")
+		if isTupleStruct(item.Fields) {
+			elemTypes := make([]string, 0, len(item.Fields))
+			for _, field := range item.Fields {
+				elemTypes = append(elemTypes, scSpecTypeToTS(field.Type))
+			}
+			writef(&b, "export type %s = [%s];\n", name, strings.Join(elemTypes, ", "))
+			continue
+		}
+		writef(&b, "export interface %s {\n", name)
+		for _, field := range item.Fields {
+			writeTSDoc(&b, field.Doc, "  ")
+			writef(&b, "  %s: %s;\n", formatTSPropertyName(field.Name), scSpecTypeToTS(field.Type))
+		}
+		b.WriteString("}\n")
+	}
+
+	for _, item := range spec.Unions {
+		startDecl()
+		writeTSDoc(&b, item.Doc, "")
+		name := claimTSIdent(item.Name, used, "Type")
+		if len(item.Cases) == 0 {
+			writef(&b, "export type %s = never;\n", name)
+			continue
+		}
+		writef(&b, "export type %s =\n", name)
+		for i, unionCase := range item.Cases {
+			arm, err := formatTSUnionCase(unionCase)
+			if err != nil {
+				return "", fmt.Errorf("union %s: %w", item.Name, err)
+			}
+			terminator := ""
+			if i == len(item.Cases)-1 {
+				terminator = ";"
+			}
+			writef(&b, "  | %s%s\n", arm, terminator)
+		}
+	}
+
+	for _, item := range spec.Enums {
+		startDecl()
+		writeTSDoc(&b, item.Doc, "")
+		name := claimTSIdent(item.Name, used, "Type")
+		writef(&b, "export enum %s {\n", name)
+		memberUsed := make(map[string]struct{}, len(item.Cases))
+		for _, enumCase := range item.Cases {
+			writeTSDoc(&b, enumCase.Doc, "  ")
+			memberName := claimTSIdent(enumCase.Name, memberUsed, "Case")
+			writef(&b, "  %s = %d,\n", memberName, enumCase.Value)
+		}
+		b.WriteString("}\n")
+	}
+
+	for _, item := range spec.Errors {
+		startDecl()
+		writeTSDoc(&b, item.Doc, "")
+		name := claimTSIdent(item.Name, used, "Error")
+		writef(&b, "export enum %s {\n", name)
+		memberUsed := make(map[string]struct{}, len(item.Cases))
+		for _, errorCase := range item.Cases {
+			writeTSDoc(&b, errorCase.Doc, "  ")
+			memberName := claimTSIdent(errorCase.Name, memberUsed, "Error")
+			writef(&b, "  %s = %d,\n", memberName, errorCase.Value)
+		}
+		b.WriteString("}\n")
+	}
+
+	eventTypeNames := make([]string, 0, len(spec.Events))
+	for _, event := range spec.Events {
+		startDecl()
+		writeTSDoc(&b, event.Doc, "")
+		name := claimTSEventIdent(event.Name, used)
+		eventTypeNames = append(eventTypeNames, name)
+		writef(&b, "export interface %s {\n", name)
+		for _, param := range event.Params {
+			loc := "data"
+			if param.Location == xdr.ScSpecEventParamLocationV0ScSpecEventParamLocationTopicList {
+				loc = "topic"
+			}
+			doc := strings.TrimSpace(param.Doc)
+			if doc != "" {
+				doc = fmt.Sprintf("[%s] %s", loc, doc)
+			} else {
+				doc = loc
+			}
+			writeTSDoc(&b, doc, "  ")
+			writef(&b, "  %s: %s;\n", formatTSPropertyName(param.Name), scSpecTypeToTS(param.Type))
+		}
+		b.WriteString("}\n")
+	}
+
+	if len(eventTypeNames) > 0 {
+		if _, exists := used["ContractEvent"]; !exists {
+			b.WriteByte('\n')
+			writef(&b, "export type ContractEvent = %s;\n", strings.Join(eventTypeNames, " | "))
+		}
+	} else if !wroteDecl {
+		b.WriteString("\nexport {};\n")
+	}
+
+	return b.String(), nil
 }
 
-// goTypeFromXDRType maps an XDR ScVal type to a Go type string.
-func goTypeFromXDRType(xdrType string) string {
-	switch xdrType {
-	case "u32":
-		return "uint32"
-	case "i32":
-		return "int32"
-	case "u64":
-		return "uint64"
-	case "i64":
-		return "int64"
-	case "bool":
-		return "bool"
-	case "address":
-		return "string"
-	case "symbol":
-		return "string"
+func formatTSUnionCase(unionCase xdr.ScSpecUdtUnionCaseV0) (string, error) {
+	switch unionCase.Kind {
+	case xdr.ScSpecUdtUnionCaseV0KindScSpecUdtUnionCaseVoidV0:
+		if unionCase.VoidCase == nil {
+			return "", fmt.Errorf("union case is missing its void payload")
+		}
+		return fmt.Sprintf("{ tag: %q }", unionCase.VoidCase.Name), nil
+	case xdr.ScSpecUdtUnionCaseV0KindScSpecUdtUnionCaseTupleV0:
+		if unionCase.TupleCase == nil {
+			return "", fmt.Errorf("union case is missing its tuple payload")
+		}
+		if len(unionCase.TupleCase.Type) == 0 {
+			return fmt.Sprintf("{ tag: %q }", unionCase.TupleCase.Name), nil
+		}
+		parts := make([]string, 0, len(unionCase.TupleCase.Type))
+		for _, typ := range unionCase.TupleCase.Type {
+			parts = append(parts, scSpecTypeToTS(typ))
+		}
+		return fmt.Sprintf("{ tag: %q; values: [%s] }", unionCase.TupleCase.Name, strings.Join(parts, ", ")), nil
 	default:
-		return "interface{}"
+		return "", fmt.Errorf("union case has unknown kind %s", unionCase.Kind)
+	}
+}
+
+// scSpecTypeToTS maps an XDR ScSpecTypeDef to an idiomatic TypeScript type.
+func scSpecTypeToTS(t xdr.ScSpecTypeDef) string {
+	switch t.Type {
+	case xdr.ScSpecTypeScSpecTypeVal, xdr.ScSpecTypeScSpecTypeError:
+		return "unknown"
+	case xdr.ScSpecTypeScSpecTypeBool:
+		return "boolean"
+	case xdr.ScSpecTypeScSpecTypeVoid:
+		return "void"
+	case xdr.ScSpecTypeScSpecTypeU32, xdr.ScSpecTypeScSpecTypeI32:
+		return "number"
+	case xdr.ScSpecTypeScSpecTypeU64,
+		xdr.ScSpecTypeScSpecTypeI64,
+		xdr.ScSpecTypeScSpecTypeTimepoint,
+		xdr.ScSpecTypeScSpecTypeDuration,
+		xdr.ScSpecTypeScSpecTypeU128,
+		xdr.ScSpecTypeScSpecTypeI128,
+		xdr.ScSpecTypeScSpecTypeU256,
+		xdr.ScSpecTypeScSpecTypeI256:
+		return "bigint"
+	case xdr.ScSpecTypeScSpecTypeBytes, xdr.ScSpecTypeScSpecTypeBytesN:
+		return "Uint8Array"
+	case xdr.ScSpecTypeScSpecTypeString,
+		xdr.ScSpecTypeScSpecTypeSymbol,
+		xdr.ScSpecTypeScSpecTypeAddress,
+		xdr.ScSpecTypeScSpecTypeMuxedAddress:
+		return "string"
+	case xdr.ScSpecTypeScSpecTypeOption:
+		if t.Option == nil {
+			return "unknown | null"
+		}
+		return scSpecTypeToTS(t.Option.ValueType) + " | null"
+	case xdr.ScSpecTypeScSpecTypeResult:
+		if t.Result == nil {
+			return "{ ok: unknown } | { err: unknown }"
+		}
+		return fmt.Sprintf("{ ok: %s } | { err: %s }",
+			scSpecTypeToTS(t.Result.OkType),
+			scSpecTypeToTS(t.Result.ErrorType))
+	case xdr.ScSpecTypeScSpecTypeVec:
+		if t.Vec == nil {
+			return "Array<unknown>"
+		}
+		return "Array<" + scSpecTypeToTS(t.Vec.ElementType) + ">"
+	case xdr.ScSpecTypeScSpecTypeMap:
+		if t.Map == nil {
+			return "Array<[unknown, unknown]>"
+		}
+		keyType := scSpecTypeToTS(t.Map.KeyType)
+		valType := scSpecTypeToTS(t.Map.ValueType)
+		if keyType == "string" || keyType == "number" {
+			return fmt.Sprintf("Record<%s, %s>", keyType, valType)
+		}
+		return fmt.Sprintf("Array<[%s, %s]>", keyType, valType)
+	case xdr.ScSpecTypeScSpecTypeTuple:
+		if t.Tuple == nil {
+			return "[]"
+		}
+		parts := make([]string, 0, len(t.Tuple.ValueTypes))
+		for _, typ := range t.Tuple.ValueTypes {
+			parts = append(parts, scSpecTypeToTS(typ))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case xdr.ScSpecTypeScSpecTypeUdt:
+		if t.Udt == nil {
+			return "unknown"
+		}
+		return sanitizeTSIdent(t.Udt.Name)
+	default:
+		return "unknown"
+	}
+}
+
+func isTupleStruct(fields []xdr.ScSpecUdtStructFieldV0) bool {
+	if len(fields) == 0 {
+		return false
+	}
+	for i, field := range fields {
+		if field.Name != strconv.Itoa(i) {
+			return false
+		}
+	}
+	return true
+}
+
+func writef(b *strings.Builder, format string, args ...any) {
+	b.WriteString(fmt.Sprintf(format, args...))
+}
+
+func writeTSDoc(b *strings.Builder, doc, indent string) {
+	doc = strings.TrimSpace(doc)
+	if doc == "" {
+		return
+	}
+	// Prevent embedded comment terminators from breaking JSDoc blocks.
+	doc = strings.ReplaceAll(doc, "*/", "* /")
+	lines := strings.Split(doc, "\n")
+	if len(lines) == 1 {
+		writef(b, "%s/** %s */\n", indent, strings.TrimSpace(lines[0]))
+		return
+	}
+	writef(b, "%s/**\n", indent)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			writef(b, "%s *\n", indent)
+			continue
+		}
+		writef(b, "%s * %s\n", indent, trimmed)
+	}
+	writef(b, "%s */\n", indent)
+}
+
+func formatTSPropertyName(name string) string {
+	if isValidJSIdent(name) {
+		return name
+	}
+	return strconv.Quote(name)
+}
+
+func claimTSEventIdent(raw string, used map[string]struct{}) string {
+	base := sanitizeTSIdent(raw)
+	if _, exists := used[base]; exists && !strings.HasSuffix(base, "Event") {
+		base += "Event"
+	}
+	return claimUniqueIdent(base, used)
+}
+
+func claimTSIdent(raw string, used map[string]struct{}, fallback string) string {
+	if strings.TrimSpace(raw) == "" {
+		return claimUniqueIdent(fallback, used)
+	}
+	return claimUniqueIdent(sanitizeTSIdent(raw), used)
+}
+
+func claimUniqueIdent(base string, used map[string]struct{}) string {
+	candidate := base
+	for i := 2; ; i++ {
+		if _, exists := used[candidate]; !exists {
+			used[candidate] = struct{}{}
+			return candidate
+		}
+		candidate = base + strconv.Itoa(i)
+	}
+}
+
+func sanitizeTSIdent(raw string) string {
+	var b strings.Builder
+	for i, r := range raw {
+		if i == 0 {
+			if unicode.IsLetter(r) || r == '_' || r == '$' {
+				b.WriteRune(r)
+				continue
+			}
+			b.WriteByte('_')
+			if unicode.IsDigit(r) {
+				b.WriteRune(r)
+			}
+			continue
+		}
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '$' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	ident := b.String()
+	if ident == "" {
+		return "_"
+	}
+	if isTSReservedKeyword(ident) {
+		return ident + "_"
+	}
+	return ident
+}
+
+func isValidJSIdent(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if !unicode.IsLetter(r) && r != '_' && r != '$' {
+				return false
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' {
+			return false
+		}
+	}
+	return true
+}
+
+func isTSReservedKeyword(s string) bool {
+	switch s {
+	case "break", "case", "catch", "class", "const", "continue", "debugger",
+		"default", "delete", "do", "else", "enum", "export", "extends", "false",
+		"finally", "for", "function", "if", "import", "in", "instanceof", "new",
+		"null", "return", "super", "switch", "this", "throw", "true", "try",
+		"typeof", "var", "void", "while", "with", "as", "implements", "interface",
+		"let", "package", "private", "protected", "public", "static", "yield",
+		"any", "boolean", "constructor", "declare", "get", "module", "require",
+		"number", "set", "string", "symbol", "type", "from", "of", "unknown",
+		"never", "bigint", "object":
+		return true
+	default:
+		return false
 	}
 }
