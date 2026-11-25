@@ -321,7 +321,11 @@ func (h *Human) emitTransaction(r stream.Record) error {
 		}
 	}
 	if t.Failure.Trapped() {
-		fmt.Fprintf(&b, "  %strapped%s", p.Remove, p.Reset)
+		if t.Failure.Operation.ContractError != "" {
+			fmt.Fprintf(&b, "  %strapped (%s)%s", p.Remove, t.Failure.Operation.ContractError, p.Reset)
+		} else {
+			fmt.Fprintf(&b, "  %strapped%s", p.Remove, p.Reset)
+		}
 	}
 	if t.FeeBump != nil {
 		fmt.Fprintf(&b, "  %sfee-bump by %s%s", p.Dim, shorten(t.FeeBump.FeeAccount), p.Reset)
@@ -402,9 +406,16 @@ func (h *Human) emitFailure(f *stream.Failure) error {
 			}
 		}
 		if f.Operation.Trapped {
-			if _, err := fmt.Fprintf(h.w, "  %scontract execution trapped or panicked%s\n",
-				p.Remove, p.Reset); err != nil {
-				return fmt.Errorf("human: write: %w", err)
+			if f.Operation.ContractError != "" {
+				if _, err := fmt.Fprintf(h.w, "  %scontract execution trapped: %s%s\n",
+					p.Remove, f.Operation.ContractError, p.Reset); err != nil {
+					return fmt.Errorf("human: write: %w", err)
+				}
+			} else {
+				if _, err := fmt.Fprintf(h.w, "  %scontract execution trapped or panicked%s\n",
+					p.Remove, p.Reset); err != nil {
+					return fmt.Errorf("human: write: %w", err)
+				}
 			}
 		}
 	} else if f.Inner != nil {

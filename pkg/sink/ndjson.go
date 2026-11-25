@@ -171,13 +171,16 @@ type failureLine struct {
 // operationFailureLine is the documented NDJSON shape for the first failing
 // operation of a transaction.
 type operationFailureLine struct {
-	Index    int    `json:"index"`
-	Type     string `json:"type,omitempty"`
-	Trapped  bool   `json:"trapped,omitempty"`
-	Code     string `json:"code,omitempty"`
-	Constant string `json:"constant,omitempty"`
-	Summary  string `json:"summary,omitempty"`
-	Hint     string `json:"hint,omitempty"`
+	Index             int     `json:"index"`
+	Type              string  `json:"type,omitempty"`
+	Trapped           bool    `json:"trapped,omitempty"`
+	Code              string  `json:"code,omitempty"`
+	Constant          string  `json:"constant,omitempty"`
+	Summary           string  `json:"summary,omitempty"`
+	Hint              string  `json:"hint,omitempty"`
+	ContractID        string  `json:"contractId,omitempty"`
+	ContractErrorCode *uint32 `json:"contractErrorCode,omitempty"`
+	ContractError     string  `json:"contractError,omitempty"`
 }
 
 // feeBumpLine is the documented NDJSON shape for fee-bump classification.
@@ -596,13 +599,16 @@ func failureLineOf(failure *stream.Failure) *failureLine {
 	}
 	if failure.Operation != nil {
 		line.Operation = &operationFailureLine{
-			Index:    failure.Operation.Index,
-			Type:     failure.Operation.Type,
-			Trapped:  failure.Operation.Trapped,
-			Code:     failure.Operation.Detail.Code,
-			Constant: failure.Operation.Detail.Constant,
-			Summary:  failure.Operation.Detail.Summary,
-			Hint:     failure.Operation.Detail.Hint,
+			Index:             failure.Operation.Index,
+			Type:              failure.Operation.Type,
+			Trapped:           failure.Operation.Trapped,
+			Code:              failure.Operation.Detail.Code,
+			Constant:          failure.Operation.Detail.Constant,
+			Summary:           failure.Operation.Detail.Summary,
+			Hint:              failure.Operation.Detail.Hint,
+			ContractID:        failure.Operation.ContractID,
+			ContractErrorCode: failure.Operation.ContractErrorCode,
+			ContractError:     failure.Operation.ContractError,
 		}
 	}
 	return line

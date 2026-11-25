@@ -106,19 +106,22 @@ start the next run where the last one stopped.`,
 				boolPart(trapped, "trapped"),
 				boolPart(feeBump, "fee-bump"))
 
+			errorResolver := newContractErrorResolver(client)
 			newSource := func(startLedger uint32) (stream.Source, error) {
 				if len(statuses) == 0 && len(filters) == 0 {
 					return stream.NewTransactionSource(client, stream.TransactionQuery{
-						StartLedger: startLedger,
-						PageLimit:   sf.pageSize,
-						Classify:    true,
+						StartLedger:   startLedger,
+						PageLimit:     sf.pageSize,
+						Classify:      true,
+						ErrorResolver: errorResolver,
 					}), nil
 				}
 				return stream.NewTransactionFilterSource(client, stream.TransactionFilterQuery{
-					StartLedger: startLedger,
-					PageLimit:   sf.pageSize,
-					Statuses:    statuses,
-					Filters:     filters,
+					StartLedger:   startLedger,
+					PageLimit:     sf.pageSize,
+					Statuses:      statuses,
+					Filters:       filters,
+					ErrorResolver: errorResolver,
 				})
 			}
 			sf.derivedKey = cursorKey(cmd.Name(), fromKeyPart(sf.from))

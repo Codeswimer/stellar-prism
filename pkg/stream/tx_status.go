@@ -49,6 +49,13 @@ type OperationFailure struct {
 	// Trapped reports a Soroban host function that trapped or panicked.
 	// It is the predicate behind `prism transactions --trapped`.
 	Trapped bool
+	// ContractID is the failing Soroban contract strkey, when known.
+	ContractID string
+	// ContractErrorCode is the numeric error code emitted via Error(Contract, #N).
+	ContractErrorCode *uint32
+	// ContractError is the formatted contract error name (e.g.
+	// "ContractError::NotAuthorized" or "Error(Contract, #1)").
+	ContractError string
 }
 
 // Failure explains why a transaction failed.
@@ -253,6 +260,9 @@ type TransactionFilterQuery struct {
 	// Filters are ANDed: a transaction is emitted only when every filter
 	// accepts it. Empty means no predicate beyond Statuses.
 	Filters []TransactionFilter
+	// ErrorResolver optionally maps numeric Soroban contract error codes to
+	// enum variant names from the contract spec.
+	ErrorResolver ContractErrorResolver
 }
 
 // TransactionFilterSource streams classified transactions that match a
@@ -300,9 +310,10 @@ func NewTransactionFilterSource(client rpc.Client, q TransactionFilterQuery) (*T
 	}
 	return &TransactionFilterSource{
 		tx: NewTransactionSource(client, TransactionQuery{
-			StartLedger: q.StartLedger,
-			PageLimit:   q.PageLimit,
-			Classify:    true,
+			StartLedger:   q.StartLedger,
+			PageLimit:     q.PageLimit,
+			Classify:      true,
+			ErrorResolver: q.ErrorResolver,
 		}),
 		statuses: statuses,
 		filters:  q.Filters,

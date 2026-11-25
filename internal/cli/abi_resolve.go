@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -714,4 +715,92 @@ func writeIndentedValue(w io.Writer, value *lens.Value, palette lensformat.Palet
 		}
 	}
 	return nil
+}
+
+// extractErrorEnums maps numeric contract error codes from ScSpecEntry
+// error-enum definitions to "EnumName::VariantName" strings.
+func extractErrorEnums(entries []xdr.ScSpecEntry) map[uint32]string {
+	out := make(map[uint32]string)
+	for _, entry := range entries {
+		if entry.Kind != xdr.ScSpecEntryKindScSpecEntryUdtErrorEnumV0 || entry.UdtErrorEnumV0 == nil {
+			continue
+		}
+		for _, c := range entry.UdtErrorEnumV0.Cases {
+			out[c.Value] = formatContractErrorName(entry.UdtErrorEnumV0.Name, c.Name)
+		}
+	}
+	return out
+}
+
+func (s *contractSpec) errorEnumMap() map[uint32]string {
+	out := make(map[uint32]string)
+	for _, item := range s.Errors {
+		for _, c := range item.Cases {
+			out[c.Value] = formatContractErrorName(item.Name, c.Name)
+		}
+	}
+	return out
+}
+
+func (s *contractSpec) resolveErrorCode(code uint32) (string, bool) {
+	for _, item := range s.Errors {
+		for _, c := range item.Cases {
+			if c.Value == code {
+				return formatContractErrorName(item.Name, c.Name), true
+			}
+		}
+	}
+	return "", false
+}
+
+func formatContractErrorName(enumName, caseName string) string {
+	if enumName == "" {
+		return caseName
+	}
+	return enumName + "::" + caseName
+}
+
+// contractErrorResolver resolves numeric Soroban contract error codes by
+// fetching and caching each contract's on-chain WASM spec once per contract ID.
+type contractErrorResolver struct {
+	client prismrpc.Client
+	mu     sync.Mutex
+	cache  map[string]map[uint32]string
+}
+
+func newContractErrorResolver(client prismrpc.Client) *contractErrorResolver {
+	if _, ok := client.(prismrpc.LedgerEntriesClient); !ok {
+		return nil
+	}
+	return &contractErrorResolver{
+		client: client,
+		cache:  make(map[string]map[uint32]string),
+	}
+}
+
+func (r *contractErrorResolver) ResolveContractError(ctx context.Context, contractID string, code uint32) (string, bool) {
+	if r == nil || contractID == "" {
+		return "", false
+	}
+
+	r.mu.Lock()
+	table, cached := r.cache[contractID]
+	r.mu.Unlock()
+
+	if !cached {
+		spec, err := resolveContractSpec(ctx, r.client, contractID)
+		if err == nil && spec != nil {
+			table = spec.errorEnumMap()
+		}
+		r.mu.Lock()
+		if existing, ok := r.cache[contractID]; ok {
+			table = existing
+		} else {
+			r.cache[contractID] = table
+		}
+		r.mu.Unlock()
+	}
+
+	name, ok := table[code]
+	return name, ok
 }

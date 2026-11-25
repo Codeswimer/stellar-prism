@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -706,5 +708,180 @@ func TestWriteUnionCaseRejectsMalformedCases(t *testing.T) {
 				t.Fatal("writeUnionCase() error = nil, want a failure")
 			}
 		})
+	}
+}
+
+func TestExtractErrorEnumsAndResolveCode(t *testing.T) {
+	t.Parallel()
+
+	entries := []xdr.ScSpecEntry{
+		{
+			Kind: xdr.ScSpecEntryKindScSpecEntryUdtErrorEnumV0,
+			UdtErrorEnumV0: &xdr.ScSpecUdtErrorEnumV0{
+				Name: "ContractError",
+				Cases: []xdr.ScSpecUdtErrorEnumCaseV0{
+					{Name: "NotAuthorized", Value: 1},
+					{Name: "InsufficientBalance", Value: 2},
+				},
+			},
+		},
+	}
+
+	got := extractErrorEnums(entries)
+	if got[1] != "ContractError::NotAuthorized" {
+		t.Errorf("code 1 = %q, want ContractError::NotAuthorized", got[1])
+	}
+	if got[2] != "ContractError::InsufficientBalance" {
+		t.Errorf("code 2 = %q, want ContractError::InsufficientBalance", got[2])
+	}
+
+	var spec contractSpec
+	if err := spec.add(entries); err != nil {
+		t.Fatalf("spec.add() error = %v", err)
+	}
+	if name, ok := spec.resolveErrorCode(1); !ok || name != "ContractError::NotAuthorized" {
+		t.Errorf("resolveErrorCode(1) = (%q, %v), want (ContractError::NotAuthorized, true)", name, ok)
+	}
+	if _, ok := spec.resolveErrorCode(99); ok {
+		t.Error("resolveErrorCode(99) = true, want false")
+	}
+}
+
+func TestContractErrorResolverCachesAndHandlesMissingSpecs(t *testing.T) {
+	contractID := testContractID(t)
+	wasm := testWasm(t, xdr.ScSpecEntry{
+		Kind: xdr.ScSpecEntryKindScSpecEntryUdtErrorEnumV0,
+		UdtErrorEnumV0: &xdr.ScSpecUdtErrorEnumV0{
+			Name: "ContractError",
+			Cases: []xdr.ScSpecUdtErrorEnumCaseV0{
+				{Name: "NotAuthorized", Value: 1},
+				{Name: "InsufficientBalance", Value: 2},
+			},
+		},
+	})
+	srv := fakerpc.NewServer(nil)
+	if err := srv.SetContractWasm(contractID, wasm); err != nil {
+		t.Fatalf("SetContractWasm() error = %v", err)
+	}
+
+	resolver := newContractErrorResolver(srv)
+	if resolver == nil {
+		t.Fatal("newContractErrorResolver() = nil, want resolver")
+	}
+
+	name, ok := resolver.ResolveContractError(context.Background(), contractID, 1)
+	if !ok || name != "ContractError::NotAuthorized" {
+		t.Fatalf("first resolve = (%q, %v), want (ContractError::NotAuthorized, true)", name, ok)
+	}
+	callsAfterFirst := srv.Calls()
+
+	name2, ok2 := resolver.ResolveContractError(context.Background(), contractID, 2)
+	if !ok2 || name2 != "ContractError::InsufficientBalance" {
+		t.Fatalf("second resolve = (%q, %v), want (ContractError::InsufficientBalance, true)", name2, ok2)
+	}
+	if srv.Calls() != callsAfterFirst {
+		t.Errorf("expected cached spec lookup, got calls %d -> %d", callsAfterFirst, srv.Calls())
+	}
+
+	if _, ok := resolver.ResolveContractError(context.Background(), testContractID(t), 1); ok {
+		t.Error("expected missing contract to return ok=false")
+	}
+	if newContractErrorResolver(streamOnlyClient{}) != nil {
+		t.Error("expected nil resolver when client lacks GetLedgerEntries")
+	}
+}
+
+func TestTransactionsTrappedDisplaysContractErrorEnumName(t *testing.T) {
+	contractID := testContractID(t)
+	rawID, err := strkey.Decode(strkey.VersionByteContract, contractID)
+	if err != nil {
+		t.Fatalf("strkey.Decode() error = %v", err)
+	}
+	var xdrContractID xdr.ContractId
+	copy(xdrContractID[:], rawID)
+
+	wasm := testWasm(t, xdr.ScSpecEntry{
+		Kind: xdr.ScSpecEntryKindScSpecEntryUdtErrorEnumV0,
+		UdtErrorEnumV0: &xdr.ScSpecUdtErrorEnumV0{
+			Name: "ContractError",
+			Cases: []xdr.ScSpecUdtErrorEnumCaseV0{
+				{Name: "NotAuthorized", Value: 1},
+			},
+		},
+	})
+
+	errCode := xdr.Uint32(1)
+	errSym := xdr.ScSymbol("error")
+	diagMeta := xdr.TransactionMeta{
+		V: 4,
+		V4: &xdr.TransactionMetaV4{
+			DiagnosticEvents: []xdr.DiagnosticEvent{{
+				InSuccessfulContractCall: false,
+				Event: xdr.ContractEvent{
+					ContractId: &xdrContractID,
+					Type:       xdr.ContractEventTypeDiagnostic,
+					Body: xdr.ContractEventBody{
+						V: 0,
+						V0: &xdr.ContractEventV0{
+							Topics: []xdr.ScVal{
+								{Type: xdr.ScValTypeScvSymbol, Sym: &errSym},
+								{
+									Type: xdr.ScValTypeScvError,
+									Error: &xdr.ScError{
+										Type:         xdr.ScErrorTypeSceContract,
+										ContractCode: &errCode,
+									},
+								},
+							},
+							Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid},
+						},
+					},
+				},
+			}},
+		},
+	}
+	metaBytes, err := diagMeta.MarshalBinary()
+	if err != nil {
+		t.Fatalf("diagMeta.MarshalBinary() error = %v", err)
+	}
+
+	envelope := cliUploadEnvelope(t, []byte{0x00, 0x61, 0x73, 0x6d})
+	trappedTx := cliTransaction(9650, "trap-with-code", protocol.TransactionStatusFailed, envelope, base64.StdEncoding.EncodeToString(metaBytes))
+	trappedTx.ResultXDR = cliResultXDR(t, xdr.TransactionResultCodeTxFailed,
+		cliInvokeResult(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped))
+
+	srv := fakerpc.NewTransactionServer([]protocol.TransactionInfo{trappedTx})
+	if err := srv.SetContractWasm(contractID, wasm); err != nil {
+		t.Fatalf("SetContractWasm() error = %v", err)
+	}
+	withFake(t, srv)
+
+	humanOut, _, err := run(t, "transactions", "--from", "9650", "--trapped", "--color", "never")
+	if err != nil {
+		t.Fatalf("human run error = %v", err)
+	}
+	if !strings.Contains(humanOut, "ContractError::NotAuthorized") {
+		t.Errorf("human output missing ContractError::NotAuthorized\n%s", humanOut)
+	}
+	if strings.Contains(humanOut, "Error(Contract, #1)") {
+		t.Errorf("human output still displays raw Error(Contract, #1)\n%s", humanOut)
+	}
+
+	jsonOut, _, err := run(t, "transactions", "--from", "9650", "--trapped", "--json")
+	if err != nil {
+		t.Fatalf("json run error = %v", err)
+	}
+	var parsed struct {
+		Failure struct {
+			Operation *struct {
+				ContractError string `json:"contractError"`
+			} `json:"operation"`
+		} `json:"failure"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(jsonOut)), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v\n%s", err, jsonOut)
+	}
+	if parsed.Failure.Operation == nil || parsed.Failure.Operation.ContractError != "ContractError::NotAuthorized" {
+		t.Errorf("operation contractError = %+v, want ContractError::NotAuthorized", parsed.Failure.Operation)
 	}
 }

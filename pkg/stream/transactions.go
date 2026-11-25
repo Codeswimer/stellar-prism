@@ -32,6 +32,9 @@ type TransactionQuery struct {
 	// FeeBump and Failure. It costs two XDR decodes per record, so it is
 	// opt-in; the filtered transaction sources enable it automatically.
 	Classify bool
+	// ErrorResolver optionally maps numeric Soroban contract error codes on
+	// trapped transactions to enum variant names from the contract spec.
+	ErrorResolver ContractErrorResolver
 }
 
 // TransactionSource streams transactions from RPC.
@@ -103,6 +106,9 @@ func (s *TransactionSource) Fetch(ctx context.Context, cursor string) (Batch, er
 		if s.query.Classify {
 			if err := EnrichTransaction(record.Transaction); err != nil {
 				return Batch{}, fmt.Errorf("transaction source: %w", err)
+			}
+			if record.Transaction.Failure != nil {
+				ResolveTrappedError(ctx, record.Transaction, s.query.ErrorResolver)
 			}
 		}
 		if s.query.Memo != "" && (record.Transaction.Memo == nil || record.Transaction.Memo.Type != "text" || !strings.HasPrefix(record.Transaction.Memo.Value, s.query.Memo)) {
