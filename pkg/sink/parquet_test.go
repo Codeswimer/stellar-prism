@@ -41,6 +41,18 @@ type partRow struct {
 
 func readParts(t *testing.T, dir string) []partRow {
 	t.Helper()
+	return readParquetGlob(t, filepath.Join(dir, "*.parquet"))
+}
+
+// readPartFile reads a single part file, so a test can check how rows are
+// split across parts rather than only their total.
+func readPartFile(t *testing.T, path string) []partRow {
+	t.Helper()
+	return readParquetGlob(t, path)
+}
+
+func readParquetGlob(t *testing.T, glob string) []partRow {
+	t.Helper()
 
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -48,7 +60,7 @@ func readParts(t *testing.T, dir string) []partRow {
 	}
 	defer func() { _ = db.Close() }()
 
-	pattern := strings.ReplaceAll(filepath.Join(dir, "*.parquet"), "'", "''")
+	pattern := strings.ReplaceAll(glob, "'", "''")
 	rows, err := db.Query(fmt.Sprintf(
 		`SELECT id, ledger, kind, closed_at, topics_xdr, value_xdr, successful
 		 FROM read_parquet('%s') ORDER BY id`, pattern))
@@ -223,6 +235,93 @@ func TestParquetBatchSizeSplitsParts(t *testing.T) {
 	}
 }
 
+// TestParquetMaxFileBytesRotatesParts covers size-based rotation: a part is
+// written once the staged rows reach MaxFileBytes, even though BatchSize was
+// never reached.
+func TestParquetMaxFileBytesRotatesParts(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	const (
+		maxBytes     = 2000
+		payloadBytes = 900
+		rows         = 5
+	)
+	s := newTestParquet(t, sink.ParquetConfig{
+		Dir:          dir,
+		BatchSize:    1000, // never reached, so only size can rotate
+		MaxFileBytes: maxBytes,
+	})
+
+	for i := range rows {
+		r := eventRecord()
+		r.ID = fmt.Sprintf("%010d-0000", 100+i)
+		r.Event.ValueXDR = strings.Repeat("a", payloadBytes)
+		if err := s.Emit(r); err != nil {
+			t.Fatalf("Emit(%d) error = %v", i, err)
+		}
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	files := partFiles(t, dir)
+	if len(files) < 2 {
+		t.Fatalf("wrote %d part files, want more than 1 — MaxFileBytes must rotate before BatchSize", len(files))
+	}
+
+	total := 0
+	for _, f := range files {
+		got := readPartFile(t, f)
+		if len(got) == 0 {
+			t.Errorf("part %s is empty", filepath.Base(f))
+		}
+		if len(got) >= rows {
+			t.Errorf("part %s holds %d rows, want fewer than all %d — rotation must bound each part",
+				filepath.Base(f), len(got), rows)
+		}
+		total += len(got)
+	}
+	if total != rows {
+		t.Errorf("read back %d rows, want %d — size rotation must not lose or duplicate rows", total, rows)
+	}
+	if got := s.Parts(); got != len(files) {
+		t.Errorf("Parts() = %d, want %d", got, len(files))
+	}
+	if got := s.Written(); got != rows {
+		t.Errorf("Written() = %d, want %d", got, rows)
+	}
+}
+
+// TestParquetZeroMaxFileBytesDisablesSizeRotation pins the documented zero
+// value: parts are then bounded by BatchSize alone.
+func TestParquetZeroMaxFileBytesDisablesSizeRotation(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	s := newTestParquet(t, sink.ParquetConfig{Dir: dir, BatchSize: 1000})
+
+	for i := range 5 {
+		r := eventRecord()
+		r.ID = fmt.Sprintf("%010d-0000", 100+i)
+		r.Event.ValueXDR = strings.Repeat("a", 900)
+		if err := s.Emit(r); err != nil {
+			t.Fatalf("Emit(%d) error = %v", i, err)
+		}
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	files := partFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("wrote %d part files, want 1 — a zero MaxFileBytes must not rotate", len(files))
+	}
+	if got := len(readParts(t, dir)); got != 5 {
+		t.Errorf("read back %d rows, want 5", got)
+	}
+}
+
 // TestParquetFlushesOnInterval covers the timer path, which is what makes the
 // sink usable for a live tail rather than only for a bounded backfill.
 func TestParquetFlushesOnInterval(t *testing.T) {
@@ -323,6 +422,7 @@ func TestParquetRejectsBadConfig(t *testing.T) {
 		{name: "prefix is dot dot", cfg: sink.ParquetConfig{Dir: t.TempDir(), Prefix: ".."}},
 		{name: "unknown compression", cfg: sink.ParquetConfig{Dir: t.TempDir(), Compression: "brotli"}},
 		{name: "negative batch", cfg: sink.ParquetConfig{Dir: t.TempDir(), BatchSize: -5}},
+		{name: "negative max file bytes", cfg: sink.ParquetConfig{Dir: t.TempDir(), MaxFileBytes: -1}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
